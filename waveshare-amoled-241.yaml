@@ -14,11 +14,13 @@ esp32:
     type: esp-idf
   flash_size: 16MB
 
+#Enable the 8mb of PSRAM to be used as the frame buffer for the display
 psram:
   mode: octal
   speed: 80MHz
 
-external_components:
+# The external components are for the IMU driver it's ONLY needed for the IMU, if you don't need the IMU remove that sensor and these lines
+external_components: 
   - source: components
 
 # Enable logging
