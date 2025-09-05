@@ -1,0 +1,514 @@
+esphome:
+  name: "esphome-with-screen"
+  friendly_name: ESPHome WithScreen
+  min_version: 2025.5.0
+  name_add_mac_suffix: false
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // On boot, shrink the range a little so seasonal drift adjusts gradually
+          if (id(highest_ldr) > id(lowest_ldr)) {
+            float ldr_range = id(highest_ldr) - id(lowest_ldr);
+            id(highest_ldr) = id(highest_ldr) - 0.05f * ldr_range;
+            id(lowest_ldr)  = id(lowest_ldr)  + 0.05f * ldr_range;
+            ESP_LOGD("LDR", "Adjusted range on boot: High=%.3f, Low=%.3f", id(highest_ldr), id(lowest_ldr));
+          }
+      - pcf85063.read_time: my_rtc
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+  flash_size: 16MB
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source: components
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+
+# Allow Over-The-Air updates
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Enable web server
+web_server:
+  port: 80
+
+# Time component for Home Assistant
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time_sync:
+      then:
+        - lambda: 'id(my_rtc).write_time();'  # Write NTP time to RTC
+        - logger.log: "Synced RTC to NTP time"
+  - platform: pcf85063
+    id: my_rtc
+
+globals:
+  - id: highest_ldr
+    type: float
+    restore_value: yes   # persists across reboots
+    initial_value: '0.0'
+  - id: lowest_ldr
+    type: float
+    restore_value: yes
+    initial_value: '99999.0'
+  - id: last_brightness
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: screen_brightness
+    type: float
+    initial_value: '255.0'
+
+button:
+  - platform: template
+    name: "Reset LDR Range"
+    id: reset_ldr_button
+    on_press:
+      - lambda: |-
+          id(highest_ldr) = 0.0f;
+          id(lowest_ldr) = 99999.0f;
+          ESP_LOGD("LDR", "Reset LDR calibration range via button");
+
+switch:
+  - platform: gpio
+    pin: 16
+    name: "Lithium Battery Enable"
+  - platform: gpio
+    pin: 4
+    id: vcc1
+    restore_mode: ALWAYS_ON
+    internal: True
+          
+# Sensors for Wi-Fi signal strength
+sensor:
+  - platform: qmi8658
+    i2c_id: my_i2c
+    update_interval: 5s
+    accel_x:
+      name: "QMI8658 Accel X"
+    accel_y:
+      name: "QMI8658 Accel Y"
+    accel_z:
+      name: "QMI8658 Accel Z"
+    gyro_x:
+      name: "QMI8658 Gyro X"
+    gyro_y:
+      name: "QMI8658 Gyro Y"
+    gyro_z:
+      name: "QMI8658 Gyro Z"
+    temperature:
+      name: "QMI8658 Temperature"
+  - platform: wifi_signal
+    name: "WiFi Signal Strength"
+    id: wifi_signal_db
+    update_interval: 5s
+  - platform: adc
+    name: "Brightness Sensor"
+    pin: 1
+    id: ldr_raw
+    internal: False
+    entity_category: diagnostic
+    update_interval: 2s   # sample every 2 seconds
+    attenuation: 12db     # ESP32 only, for 0–3.3V range
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10   # number of samples to average
+          send_every: 1     # send out one value per sec
+    on_value:
+      then:
+        - lambda: |-
+            float ldr_value = x;
+
+            // Update min/max
+            if (ldr_value > id(highest_ldr)) {
+              id(highest_ldr) = ldr_value;
+            }
+            if (ldr_value < id(lowest_ldr)) {
+              id(lowest_ldr) = ldr_value;
+            }
+
+            // Calculate brightness scaling
+            float brightness = 1.0;
+            if (id(highest_ldr) > id(lowest_ldr)) {
+              float ldr_range = id(highest_ldr) - id(lowest_ldr);
+              float high_threshold = id(highest_ldr) - 0.2f * ldr_range;
+              float low_threshold  = id(lowest_ldr)  + 0.5f * ldr_range;
+
+              if (ldr_value >= high_threshold) {
+                brightness = 0.45f;
+              } else if (ldr_value <= low_threshold) {
+                brightness = 1.0f;
+              } else {
+                brightness = fmaxf(0.1f, fminf(1.0f,
+                  (high_threshold - ldr_value) / (high_threshold - low_threshold)
+                ));
+              }
+            }
+
+            if (fabs(brightness - id(last_brightness)) > 0.05) {  // >5% change
+              // Apply brightness to the light
+              auto call = id(rgb_light).make_call();
+              call.set_brightness(brightness);
+              call.perform();
+              id(last_brightness) = brightness;
+            }
+
+            ESP_LOGD("LDR", "Value: %.3f, Brightness: %.2f, High: %.3f, Low: %.3f", ldr_value, brightness, id(highest_ldr), id(lowest_ldr));
+
+# SPI configuration for ST7789
+spi:
+  id: quad_spi
+  type: quad
+  clk_pin: 10
+  data_pins: [11, 12, 13, 14]
+
+interval:
+  - interval: 20s # Timer to dim screen during inactivity
+    then:
+      - lambda: |-
+          id(screen_brightness) = id(screen_brightness) - (256 - id(screen_brightness)); // logarythmically dim
+          if (id(screen_brightness) < 5) { id(screen_brightness) = 5; } // make sure not too low
+          id(my_display).set_brightness(id(screen_brightness));  // apply dim
+
+# Display configuration for ST7789 TFT (240x240)
+display:
+  platform: qspi_dbi
+  id: my_display
+  model: RM690B0
+  data_rate: 80MHz
+  dimensions:
+    width: 450
+    height: 600
+    offset_width: 16
+  brightness: 255
+  cs_pin: 9
+  reset_pin: 21
+  auto_clear_enabled: false
+  update_interval: never
+
+# I2C for touchscreen
+i2c:
+  id: my_i2c
+  sda: 47
+  scl: 48
+  scan: True
+
+# Touchscreen setup
+touchscreen:
+  - platform: ft63x6
+    id: my_touchscreen
+    display: my_display
+    reset_pin: 3
+    on_touch:
+      - lambda: |-
+          id(screen_brightness) = 255.0f;
+          id(my_display).set_brightness(id(screen_brightness));
+
+# Extended IO Initialization
+pca9554:
+  - id: extendedio_hub
+    address: 0x20
+
+# Setup an extended IO for testing
+binary_sensor:
+  - platform: gpio
+    name: "Touch Interrupt (EXIO2)"
+    pin:
+      pca9554: extendedio_hub
+      number: 2
+      mode: INPUT
+      inverted: true
+    id: touch_interrupt
+
+# Font definition for display
+font:
+  - file: "gfonts://Roboto"
+    id: roboto
+    size: 30
+
+# General output for RGB LED
+output:
+  - platform: ledc
+    pin: 7
+    frequency: 1000Hz
+    id: red_channel
+    inverted: false
+  - platform: ledc
+    pin: 38
+    frequency: 1000Hz
+    id: green_channel
+    inverted: false
+  - platform: ledc
+    pin: 41
+    frequency: 1000Hz
+    id: blue_channel
+    inverted: false
+    
+# Setup the RGB outputs as an RGB light
+light:
+  - platform: rgb
+    name: "Car LEDs"
+    id: rgb_light
+    red: red_channel
+    green: green_channel
+    blue: blue_channel
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    effects:
+      - random:
+          name: "Random Fast"
+          transition_length: 2s
+          update_interval: 2s
+      - random:
+          name: "Random Med"
+          transition_length: 7s
+          update_interval: 7s
+      - random:
+          name: "Random Slow"
+          transition_length: 15s
+          update_interval: 15s
+      - random:
+          name: "Random Slowest"
+          transition_length: 30s
+          update_interval: 30s
+    on_state: 
+      then:
+        - lambda: |-
+            int h;
+            float s, v, r, g, b;
+            r = id(rgb_light).remote_values.get_red();
+            g = id(rgb_light).remote_values.get_green();
+            b = id(rgb_light).remote_values.get_blue();
+            rgb_to_hsv(r, g, b, h, s, v);
+            lv_slider_set_value(id(hue_slider), h, LV_ANIM_OFF);
+            lv_slider_set_value(id(saturation_slider), s * 100.0, LV_ANIM_OFF);
+            hsv_to_rgb(h, 1.0, 1.0, r, g, b);   // max saturation
+            lv_obj_set_style_bg_grad_color(id(saturation_slider), lv_color_make(r*255, g*255, b*255), LV_PART_MAIN);
+            int slider_val = (int)(id(rgb_light).current_values.get_brightness() * 255.0f); //Set brightness slider
+            lv_slider_set_value(id(brightness_slider), slider_val, LV_ANIM_OFF);
+        - lvgl.dropdown.update:
+            id: effect_dropdown
+            selected_index: !lambda |-
+              auto name = id(rgb_light).get_effect_name();
+              if (name == "None") return 0;
+              if (name == "Random Fast") return 1;
+              if (name == "Random Med") return 2;
+              if (name == "Random Slow") return 3;
+              if (name == "Random Slowest") return 4;
+              return 0;
+
+lvgl:
+  pages:
+    - id: main_page
+      bg_color: 0x000000   # sets background black
+      text_color: 0xFFFFFF # force text white
+      widgets:
+        # Label for dropdown
+        - label:
+            align: TOP_MID
+            y: 4%
+            text: "Select Effect"
+            text_font: roboto
+        # Dropdown for selecting LED effect
+        - dropdown:
+            id: effect_dropdown
+            align: TOP_MID
+            y: 10%
+            height: 10%
+            width: 90%
+            options:
+              - "None"
+              - "Random Fast"
+              - "Random Med"
+              - "Random Slow"              
+              - "Random Slowest"              
+            text_font: roboto
+            symbol: lv_font_montserrat_20
+            dropdown_list:
+              text_font: roboto
+            on_value:
+              - light.control:
+                  id: rgb_light
+                  effect: !lambda |-
+                    switch (x) {
+                      case 0: return "None";
+                      case 1: return "Random Fast";
+                      case 2: return "Random Med";
+                      case 3: return "Random Slow";
+                      case 4: return "Random Slowest";
+                      default: return "None";
+                    }
+        # Label for brightness slider
+        - label:
+            align: TOP_MID
+            y: 24%
+            text: "Brightness"
+            text_font: roboto
+        # Brightness slider
+        - slider:
+            id: brightness_slider
+            align: TOP_MID
+            y: 30%
+            height: 9%
+            width: 80%
+            indicator:
+              opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+              radius: 1
+              width: 5%
+              height: 10%
+              border_width: 3
+              border_color: color_dark_gray
+            bg_opa: COVER
+            border_width: 1
+            border_color: color_dark_gray
+            radius: 20
+            bg_color: 0x000000
+            bg_grad_dir: HOR
+            bg_grad_color: 0xFFFFFF
+            min_value: 0
+            max_value: 255
+            on_release:
+              - light.turn_on:
+                  id: rgb_light
+                  brightness: !lambda return x / 255.0;
+        # Label for hue slider
+        - label:
+            align: TOP_MID
+            y: 44%
+            text: "Hue"
+            text_font: roboto
+        # Hue slider with gradient
+        - slider:
+            id: hue_slider
+            align: TOP_MID
+            y: 50%
+            height: 9%
+            width: 80%
+            indicator:
+              opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+              radius: 1
+              width: 5%
+              height: 10%
+              border_width: 3
+              border_color: color_dark_gray
+            min_value: 0
+            max_value: 360
+            bg_opa: COVER
+            border_width: 1
+            border_color: color_dark_gray
+            radius: 20
+            bg_grad: id_gradient_hue
+            on_value:
+              - lambda: |-
+                  float h = lv_slider_get_value(id(hue_slider));
+                  float s = lv_slider_get_value(id(saturation_slider)) / 100.0;
+                  float r, g, b;
+                  hsv_to_rgb(h, s, 1, r, g, b);
+                  auto call = id(rgb_light).make_call();
+                  call.set_rgb(r, g, b);
+                  call.set_publish(false);   // live preview only
+                  call.perform();
+            on_release:
+              - lambda: |-
+                  float h = lv_slider_get_value(id(hue_slider));
+                  float s = lv_slider_get_value(id(saturation_slider)) / 100.0;
+                  float r, g, b;
+                  hsv_to_rgb(h, s, 1, r, g, b);
+                  id(rgb_light).turn_on()
+                    .set_rgb(r, g, b)
+                    .perform();
+                  // Update saturation slider
+                  hsv_to_rgb(h, 1.0, 1.0, r, g, b);   // max saturation
+                  lv_obj_set_style_bg_grad_color(id(saturation_slider), lv_color_make(r*255, g*255, b*255), LV_PART_MAIN);
+        # Label for saturation slider
+        - label:
+            align: TOP_MID
+            y: 64%
+            text: "Saturation"
+            text_font: roboto
+        # Saturation slider with gradient
+        - slider:
+            id: saturation_slider
+            align: TOP_MID
+            y: 70%
+            height: 9%
+            width: 80%
+            min_value: 0
+            max_value: 100
+            bg_opa: COVER
+            border_width: 1
+            border_color: color_dark_gray
+            radius: 20
+            bg_color: 0xFFFFFF
+            bg_grad_dir: HOR
+            bg_grad_color: 0x0000FF
+            indicator:
+              opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+              radius: 1
+              width: 5%
+              height: 10%
+              border_width: 3
+              border_color: color_dark_gray
+            on_value:
+              - lambda: |-
+                  float h = lv_slider_get_value(id(hue_slider));
+                  float s = x / 100.0;
+                  float r, g, b;
+                  hsv_to_rgb(h, s, 1, r, g, b);
+                  auto call = id(rgb_light).make_call();
+                  call.set_rgb(r, g, b);
+                  call.set_publish(false);   // live preview only
+                  call.perform();
+            on_release:
+              - lambda: |-
+                  float h = lv_slider_get_value(id(hue_slider));
+                  float s = x / 100.0;
+                  float r, g, b;
+                  hsv_to_rgb(h, s, 1, r, g, b);
+                  id(rgb_light).turn_on().set_rgb(r, g, b).perform();
+  gradients:
+    - id: id_gradient_hue
+      direction: HOR
+      dither: none
+      stops:
+        - color: 0xFF0000
+          position: 0
+        - color: 0xFFFF00
+          position: 42
+        - color: 0x00FF00
+          position: 84
+        - color: 0x00FFFF
+          position: 127
+        - color: 0x0000FF
+          position: 169
+        - color: 0xFF00FF
+          position: 212
+        - color: 0xFF0000
+          position: 255
+
+color:
+  - id: color_dark_gray
+    hex: 333333
