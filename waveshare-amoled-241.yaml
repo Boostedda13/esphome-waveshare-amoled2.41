@@ -1,19 +1,11 @@
+# ESPHome configuration for a device with a Waveshare AMOLED display, sensors, and RGB LEDs
 esphome:
   name: "esphome-with-screen"
   friendly_name: ESPHome WithScreen
-  min_version: 2025.5.0
   name_add_mac_suffix: false
   on_boot:
     priority: -100
     then:
-      - lambda: |-
-          // On boot, shrink the range a little so seasonal drift adjusts gradually
-          if (id(highest_ldr) > id(lowest_ldr)) {
-            float ldr_range = id(highest_ldr) - id(lowest_ldr);
-            id(highest_ldr) = id(highest_ldr) - 0.05f * ldr_range;
-            id(lowest_ldr)  = id(lowest_ldr)  + 0.05f * ldr_range;
-            ESP_LOGD("LDR", "Adjusted range on boot: High=%.3f, Low=%.3f", id(highest_ldr), id(lowest_ldr));
-          }
       - pcf85063.read_time: my_rtc
 
 esp32:
@@ -60,31 +52,9 @@ time:
     id: my_rtc
 
 globals:
-  - id: highest_ldr
-    type: float
-    restore_value: yes   # persists across reboots
-    initial_value: '0.0'
-  - id: lowest_ldr
-    type: float
-    restore_value: yes
-    initial_value: '99999.0'
-  - id: last_brightness
-    type: float
-    restore_value: no
-    initial_value: '0.0'
   - id: screen_brightness
     type: float
     initial_value: '255.0'
-
-button:
-  - platform: template
-    name: "Reset LDR Range"
-    id: reset_ldr_button
-    on_press:
-      - lambda: |-
-          id(highest_ldr) = 0.0f;
-          id(lowest_ldr) = 99999.0f;
-          ESP_LOGD("LDR", "Reset LDR calibration range via button");
 
 switch:
   - platform: gpio
@@ -95,10 +65,9 @@ switch:
     id: vcc1
     restore_mode: ALWAYS_ON
     internal: True
-          
-# Sensors for Wi-Fi signal strength
-sensor:
-  - platform: qmi8658
+
+sensor: # Sensors
+  - platform: qmi8658 #The QMI sensor needs the driver that's in the CUSTOM folder, if you need it you'll need to add those files to your ESPHome folder
     i2c_id: my_i2c
     update_interval: 5s
     accel_x:
@@ -115,62 +84,10 @@ sensor:
       name: "QMI8658 Gyro Z"
     temperature:
       name: "QMI8658 Temperature"
-  - platform: wifi_signal
+  - platform: wifi_signal #Show the Wi-Fi signal strength in Home Assistant
     name: "WiFi Signal Strength"
     id: wifi_signal_db
     update_interval: 5s
-  - platform: adc
-    name: "Brightness Sensor"
-    pin: 1
-    id: ldr_raw
-    internal: False
-    entity_category: diagnostic
-    update_interval: 2s   # sample every 2 seconds
-    attenuation: 12db     # ESP32 only, for 0–3.3V range
-    filters:
-      - sliding_window_moving_average:
-          window_size: 10   # number of samples to average
-          send_every: 1     # send out one value per sec
-    on_value:
-      then:
-        - lambda: |-
-            float ldr_value = x;
-
-            // Update min/max
-            if (ldr_value > id(highest_ldr)) {
-              id(highest_ldr) = ldr_value;
-            }
-            if (ldr_value < id(lowest_ldr)) {
-              id(lowest_ldr) = ldr_value;
-            }
-
-            // Calculate brightness scaling
-            float brightness = 1.0;
-            if (id(highest_ldr) > id(lowest_ldr)) {
-              float ldr_range = id(highest_ldr) - id(lowest_ldr);
-              float high_threshold = id(highest_ldr) - 0.2f * ldr_range;
-              float low_threshold  = id(lowest_ldr)  + 0.5f * ldr_range;
-
-              if (ldr_value >= high_threshold) {
-                brightness = 0.45f;
-              } else if (ldr_value <= low_threshold) {
-                brightness = 1.0f;
-              } else {
-                brightness = fmaxf(0.1f, fminf(1.0f,
-                  (high_threshold - ldr_value) / (high_threshold - low_threshold)
-                ));
-              }
-            }
-
-            if (fabs(brightness - id(last_brightness)) > 0.05) {  // >5% change
-              // Apply brightness to the light
-              auto call = id(rgb_light).make_call();
-              call.set_brightness(brightness);
-              call.perform();
-              id(last_brightness) = brightness;
-            }
-
-            ESP_LOGD("LDR", "Value: %.3f, Brightness: %.2f, High: %.3f, Low: %.3f", ldr_value, brightness, id(highest_ldr), id(lowest_ldr));
 
 # SPI configuration for ST7789
 spi:
@@ -200,7 +117,7 @@ display:
   brightness: 255
   cs_pin: 9
   reset_pin: 21
-  auto_clear_enabled: false
+  auto_clear_enabled: false #This and the update interval are needed if you want to use LVGL
   update_interval: never
 
 # I2C for touchscreen
@@ -210,13 +127,13 @@ i2c:
   scl: 48
   scan: True
 
-# Touchscreen setup
+# Touchscreen setup, the interrupt pin can't be used unfortunately as it's on the extended IO and ESPHome doesn't support this
 touchscreen:
   - platform: ft63x6
     id: my_touchscreen
     display: my_display
     reset_pin: 3
-    on_touch:
+    on_touch: #This sets the brightness to full on the screen if the screen is touched
       - lambda: |-
           id(screen_brightness) = 255.0f;
           id(my_display).set_brightness(id(screen_brightness));
@@ -289,7 +206,7 @@ light:
           transition_length: 30s
           update_interval: 30s
     on_state: 
-      then:
+      then: #When the light updates, update the screen to match the light
         - lambda: |-
             int h;
             float s, v, r, g, b;
@@ -489,7 +406,8 @@ lvgl:
                   float r, g, b;
                   hsv_to_rgb(h, s, 1, r, g, b);
                   id(rgb_light).turn_on().set_rgb(r, g, b).perform();
-  gradients:
+
+  gradients: #Gradient for the hue slider
     - id: id_gradient_hue
       direction: HOR
       dither: none
