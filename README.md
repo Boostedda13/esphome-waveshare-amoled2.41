@@ -22,3 +22,7 @@ I didn't manage to sort out these bits though
 For my use case I wanted to turn this into an RGB light controller with a few options, so there is a bunch of code in there associated with that, it has some LVGL examples that may be useful to some people.
 
 This is the first thing I have ever put on github so please don't be too harsh, any suggestions let me know.
+
+## PlatformIO / Arduino Port
+
+A basic PlatformIO project is provided in `platformio.ini` and `src/main.cpp`. It targets the `esp32-s3-devkitc-1` board using the Arduino framework. The example initialises LVGL, drives the RM690B0 AMOLED over the ESP32's QSPI bus via the Arduino_GFX library, and sets up an I²C bus for the FT63x6 touch controller on pins 47/48. Sliders for brightness, hue and saturation demonstrate LVGL input handling.
